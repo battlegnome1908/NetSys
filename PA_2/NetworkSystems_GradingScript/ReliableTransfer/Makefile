@@ -17,13 +17,13 @@ server: $(SERVER_BIN)
 client: $(CLIENT_BIN)
 
 # Build server binary and copy foo files
-$(SERVER_BIN): udp_server.c protocol.h
+$(SERVER_BIN): udp_server.c packets.h
 	mkdir -p $(SERVER_DIR)
 	$(CC) $(CFLAGS) -o $@ udp_server.c
 	cp -f $(FOO_FILES) $(SERVER_DIR)/
 
 # Build client binary
-$(CLIENT_BIN): udp_client.c protocol.h
+$(CLIENT_BIN): udp_client.c packets.h
 	mkdir -p $(CLIENT_DIR)
 	$(CC) $(CFLAGS) -o $@ udp_client.c
 
