@@ -203,43 +203,97 @@ void handle_exit_command(int sockfd, struct sockaddr_in *client_addr) {
 }
 
 /*
- * send_file - open the file at filepath and transmit it in DATA_SIZE chunks
- * using stop-and-wait reliability, followed by a TYPE_FILE_END marker.
+ * send_file - Go-Back-N sliding window sender.
+ *
+ * Keeps up to WINDOW_SIZE packets in flight simultaneously.  Each outer-loop
+ * iteration fills any empty window slots, transmits newly-added packets, then
+ * waits for one ACK.
+ *
+ *  - Valid cumulative ACK  → slide window forward, fill + send new packets,
+ *                            reset retry counter.
+ *  - Timeout               → retransmit the entire current window (Go Back N),
+ *                            increment retry counter.
+ *
+ * receive_file() is unchanged: it already sends cumulative ACKs and discards
+ * out-of-order packets, which is the correct GBN receiver behaviour.
  */
 int send_file(int sockfd, struct sockaddr_in *addr, const char *filepath) {
     FILE *file = fopen(filepath, "rb");
-    if (!file) {
-        perror("ERROR opening file");
-        return -1;
-    }
+    if (!file) { perror("ERROR opening file"); return -1; }
 
-    uint32_t seq_num = 0;
-    char     read_buffer[DATA_SIZE];
-    size_t   chunk_size;
+    Packet   window[WINDOW_SIZE]; /* circular buffer of unACKed packets      */
+    int      win_count  = 0;     /* packets currently in the window          */
+    int      win_sent   = 0;     /* index of first unsent packet in window[] */
+    uint32_t next_seq   = 0;     /* byte offset for the next new packet      */
+    int      file_done  = 0;     /* all file bytes have been read            */
+    int      eof_queued = 0;     /* TYPE_FILE_END packet is in the window    */
+    int      transfer_done = 0;
+    int      retries    = 0;
 
-    while ((chunk_size = fread(read_buffer, 1, DATA_SIZE, file)) > 0) {
-        Packet data_packet;
-        make_packet(&data_packet, TYPE_FILE_DATA, seq_num,
-                    read_buffer, (uint32_t)chunk_size);
-        if (send_reliable(sockfd, addr, &data_packet) < 0) {
-            fprintf(stderr, "ERROR: failed to send file chunk\n");
-            fclose(file);
-            return -1;
+    while (!transfer_done && retries < MAX_RETRIES) {
+
+        /* ── 1. Fill empty window slots ──────────────────────────────── */
+        while (win_count < WINDOW_SIZE && !eof_queued) {
+            char   buf[DATA_SIZE];
+            size_t chunk = file_done ? 0 : fread(buf, 1, DATA_SIZE, file);
+            if (chunk > 0) {
+                make_packet(&window[win_count], TYPE_FILE_DATA,
+                            next_seq, buf, (uint32_t)chunk);
+                next_seq += (uint32_t)chunk;
+            } else {
+                /* No more data — queue the EOF marker */
+                file_done = 1;
+                make_packet(&window[win_count], TYPE_FILE_END, next_seq, NULL, 0);
+                eof_queued = 1;
+            }
+            win_count++;
         }
-        seq_num += (uint32_t)chunk_size;
-    }
 
-    /* Signal end of file */
-    Packet eof_packet;
-    make_packet(&eof_packet, TYPE_FILE_END, seq_num, NULL, 0);
-    if (send_reliable(sockfd, addr, &eof_packet) < 0) {
-        fprintf(stderr, "ERROR: failed to send EOF packet\n");
-        fclose(file);
-        return -1;
+        if (win_count == 0) break; /* nothing to do */
+
+        /* ── 2. Transmit any newly-added packets ─────────────────────── */
+        for (int i = win_sent; i < win_count; i++)
+            send_packet(sockfd, &window[i], addr);
+        win_sent = win_count;
+
+        /* ── 3. Wait for one ACK (up to TIMEOUT_MS) ──────────────────── */
+        Packet ack_pkt;
+        int received = receive_packet_timeout(sockfd, &ack_pkt, addr, TIMEOUT_MS);
+        if (received < 0) { fclose(file); return -1; }
+
+        if (received == 0) {
+            /* Timeout: Go Back N — mark entire window as unsent so step 2
+             * retransmits all of them on the next iteration.             */
+            retries++;
+            win_sent = 0;
+            continue;
+        }
+
+        if (ack_pkt.type != TYPE_ACK) continue; /* ignore non-ACK traffic */
+
+        /* ── 4. Cumulative ACK: slide window forward ──────────────────── */
+        int acked = 0;
+        for (int i = 0; i < win_count; i++) {
+            if (ack_pkt.ack_num == window[i].seq_num + window[i].data_len) {
+                acked = i + 1;
+                if (window[i].type == TYPE_FILE_END) transfer_done = 1;
+                break;
+            }
+        }
+
+        if (acked > 0) {
+            memmove(&window[0], &window[acked],
+                    (win_count - acked) * sizeof(Packet));
+            win_count -= acked;
+            win_sent  -= acked;
+            if (win_sent < 0) win_sent = 0;
+            retries = 0;
+        }
+        /* acked == 0 means a duplicate/stale ACK; loop and wait for the next */
     }
 
     fclose(file);
-    return 0;
+    return transfer_done ? 0 : -1;
 }
 
 /*

@@ -28,6 +28,7 @@
 
 /* Protocol tuning constants */
 #define MAX_RETRIES  5
+#define WINDOW_SIZE  5     /* Go-Back-N window: max unACKed packets in flight */
 #define TIMEOUT_MS   3000  /* ms to wait for an ACK before retransmitting; tune for your network */
 #define DATA_SIZE    512   /* bytes per file-data chunk */
 #define BUFSIZE      1024  /* general-purpose buffer and packet data field size */
