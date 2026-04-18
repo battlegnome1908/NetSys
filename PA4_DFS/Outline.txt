@@ -1,0 +1,300 @@
+================================================================================
+PA4 - Distributed File System (DFS) Implementation Outline
+================================================================================
+Files to produce: dfc.c, dfs.c, Makefile
+Due: 4/21/2026 | 100 pts (+ 10 extra credit for concurrent server)
+
+================================================================================
+SECTION 1: PROTOCOL DESIGN
+================================================================================
+
+All communication uses TCP. Messages begin with a text header line, followed by
+binary data where needed.
+
+-- Client -> Server messages --
+
+PUT <filename> <chunk_num> <byte_count>\n
+    Followed by <byte_count> raw bytes of chunk data.
+
+GET <filename>\n
+    Requests all chunks of <filename> that this server holds.
+
+LIST\n
+    Requests a listing of all chunks stored on this server.
+
+-- Server -> Client responses --
+
+PUT response:
+    OK\n          (success)
+    ERROR\n       (failure)
+
+GET response (one CHUNK block per stored chunk, then END):
+    CHUNK <chunk_num> <byte_count>\n
+    <byte_count> raw bytes
+    ...repeated for each chunk this server holds for that file...
+    END\n
+
+LIST response (one line per chunk file, then END):
+    <filename> <chunk_num>\n
+    ...
+    END\n
+
+================================================================================
+SECTION 2: CHUNK DISTRIBUTION TABLE
+================================================================================
+
+x = MD5(filename) % num_servers   (x is first byte of MD5 digest, mod 4)
+
+x | DFS1    DFS2    DFS3    DFS4
+--+--------------------------------
+0 | (1,2)  (2,3)  (3,4)  (4,1)
+1 | (4,1)  (1,2)  (2,3)  (3,4)
+2 | (3,4)  (4,1)  (1,2)  (2,3)
+3 | (2,3)  (3,4)  (4,1)  (1,2)
+
+Redundancy: every chunk appears on 2 servers. Any single server failure still
+leaves all 4 chunks recoverable. With 2+ servers down the file may be incomplete.
+
+================================================================================
+SECTION 3: dfs.c (SERVER)
+================================================================================
+
+STEP 3.1 - Argument parsing
+    - argc must be 3: ./dfs <directory> <port>
+    - store directory path and port
+
+STEP 3.2 - Directory setup
+    - Call mkdir(<directory>, 0755) -- ignore EEXIST
+    - All chunk files will be stored inside this directory
+
+STEP 3.3 - TCP socket setup
+    - socket(AF_INET, SOCK_STREAM, 0)
+    - setsockopt SO_REUSEADDR
+    - bind to 0.0.0.0:<port>
+    - listen(sock, 16)
+
+STEP 3.4 - Accept loop (main loop)
+    - accept() blocks waiting for connections
+    - For each connection: fork() child to handle it (extra credit / concurrent)
+      Parent closes client fd and loops back to accept.
+    - Child calls handle_client(client_fd, directory) then exits.
+
+STEP 3.5 - handle_client(client_fd, dir)
+    - Read one header line (read until '\n')
+    - Parse command: PUT / GET / LIST
+    - Dispatch to handler function
+    - Close client_fd
+
+STEP 3.6 - handle_put(client_fd, dir, filename, chunk_num, byte_count)
+    - Construct path: <dir>/<filename>.<chunk_num>
+    - Open file for writing (O_WRONLY | O_CREAT | O_TRUNC)
+    - Read exactly byte_count bytes from socket, write to file
+      (loop: recv() -> write() until all bytes received)
+    - Send "OK\n" on success, "ERROR\n" on failure
+
+STEP 3.7 - handle_get(client_fd, dir, filename)
+    - Scan directory for files matching <filename>.<1..4>
+    - For each found chunk N:
+        - Open file, get size via fstat
+        - Send "CHUNK <N> <size>\n"
+        - Send raw bytes (loop: read -> send)
+    - Send "END\n"
+
+STEP 3.8 - handle_list(client_fd, dir)
+    - opendir(dir), iterate entries
+    - For each entry whose name contains a dot (filename.chunknum format):
+        - Parse: split on last dot -> base_filename, chunk_num
+        - Validate chunk_num is 1-4
+        - Send "<base_filename> <chunk_num>\n"
+    - closedir
+    - Send "END\n"
+
+================================================================================
+SECTION 4: dfc.c (CLIENT)
+================================================================================
+
+STEP 4.1 - Data structures
+    typedef struct {
+        char name[64];     // e.g. "dfs1"
+        char host[64];     // e.g. "127.0.0.1"
+        int  port;
+        int  fd;           // socket fd, -1 if unavailable
+    } Server;
+
+    #define MAX_SERVERS 8
+    Server servers[MAX_SERVERS];
+    int num_servers;
+
+STEP 4.2 - Parse dfc.conf
+    - Open "./dfc.conf"
+    - Each line: "server <name> <host>:<port>"
+    - Populate servers[] array, set num_servers
+
+STEP 4.3 - connect_servers()
+    - For each server, attempt TCP connect with 1-second timeout:
+        - socket(AF_INET, SOCK_STREAM, 0)
+        - fcntl O_NONBLOCK
+        - connect() -- returns immediately (EINPROGRESS)
+        - select() with 1-second timeout on write fd
+        - If select times out or getsockopt(SO_ERROR) != 0: mark fd = -1
+        - Otherwise: set fd back to blocking mode, mark available
+    - Returns count of reachable servers
+
+STEP 4.4 - compute_x(filename)
+    - Use OpenSSL: MD5((unsigned char*)filename, strlen(filename), digest)
+    - x = digest[0] % num_servers
+    - Return x
+
+STEP 4.5 - get_chunks_for_server(x, server_index, chunk_a, chunk_b)
+    - Lookup table (hardcoded 4x4 int array):
+      int table[4][4][2] = {
+        {{1,2},{2,3},{3,4},{4,1}},  // x=0
+        {{4,1},{1,2},{2,3},{3,4}},  // x=1
+        {{3,4},{4,1},{1,2},{2,3}},  // x=2
+        {{2,3},{3,4},{4,1},{1,2}},  // x=3
+      };
+    - chunk_a = table[x][server_index][0]
+    - chunk_b = table[x][server_index][1]
+
+STEP 4.6 - cmd_put(filename)
+    - Open file, get total size
+    - If open fails: print error, return
+    - connect_servers()
+    - Count available servers; if < 2: printf("<filename> put failed\n"), return
+    - Compute x = compute_x(basename(filename))
+    - Split file into 4 chunks:
+        - chunk_size = (file_size + 3) / 4
+        - chunk[i] = file data from offset i*chunk_size, length chunk_size
+          (last chunk may be shorter)
+        - Read all 4 chunks into memory buffers
+    - For each available server i (0..num_servers-1):
+        - get_chunks_for_server(x, i, &ca, &cb)
+        - send_chunk(servers[i].fd, basename(filename), ca, buf[ca-1], sizes[ca-1])
+        - send_chunk(servers[i].fd, basename(filename), cb, buf[cb-1], sizes[cb-1])
+    - Close all fds
+    - Free buffers
+
+STEP 4.7 - send_chunk(fd, filename, chunk_num, data, size)
+    - Send header: "PUT <filename> <chunk_num> <size>\n"
+    - Send data bytes (loop until all sent)
+    - Read response line, check for "OK"
+
+STEP 4.8 - cmd_get(filename)
+    - connect_servers()
+    - For each available server:
+        - Send "GET <filename>\n"
+        - Read CHUNK responses until END:
+            - Parse "CHUNK <n> <size>\n"
+            - Read <size> bytes into chunk_buf[n-1]
+            - Mark chunk_have[n-1] = 1, chunk_size[n-1] = size
+            (If chunk already received, read and discard -- dedup)
+    - Check if chunk_have[0..3] all = 1:
+        - If no: printf("<filename> is incomplete\n"), return
+    - Reconstruct: open output file <filename> in cwd, write chunks 1,2,3,4 in order
+    - Close file, free buffers
+
+STEP 4.9 - cmd_list()
+    - connect_servers()
+    - Collect from each available server via "LIST\n":
+        - Parse "<filename> <chunk_num>\n" lines until "END\n"
+        - Store in a structure: map filename -> bitmask of chunks seen
+          (bit 0 = chunk1, bit 1 = chunk2, bit 2 = chunk3, bit 3 = chunk4)
+    - For each unique filename in map:
+        - If bitmask == 0b1111 (all 4 chunks): printf("%s\n", filename)
+        - Else: printf("%s [incomplete]\n", filename)
+
+STEP 4.10 - main()
+    - Parse argv: command is argv[1], optional filename is argv[2]
+    - Load dfc.conf
+    - Dispatch:
+        "put"  -> cmd_put(argv[2])
+        "get"  -> cmd_get(argv[2])
+        "list" -> cmd_list()
+        else   -> print usage
+
+================================================================================
+SECTION 5: Makefile
+================================================================================
+
+CC     = gcc
+CFLAGS = -Wall -g
+LIBS   = -lssl -lcrypto
+
+all: dfc dfs
+
+dfc: dfc.c
+    $(CC) $(CFLAGS) -o dfc dfc.c $(LIBS)
+
+dfs: dfs.c
+    $(CC) $(CFLAGS) -o dfs dfs.c $(LIBS)
+
+clean:
+    rm -f dfc dfs
+
+================================================================================
+SECTION 6: KEY IMPLEMENTATION NOTES
+================================================================================
+
+1. BASENAME: Use only the base filename (no path) for both the MD5 hash and
+   chunk filenames on the server. Use POSIX basename() or manual strrchr('/').
+
+2. CHUNK DEDUP ON GET: Multiple servers hold overlapping chunks. When receiving
+   GET responses, skip writing if chunk_have[n] already set.
+
+3. 1-SECOND CONNECT TIMEOUT: Use non-blocking connect + select(). Do NOT use
+   alarm() as it interferes with concurrency.
+
+4. CONCURRENT SERVER (extra credit): Use fork() after accept(). Parent closes
+   client fd immediately and loops. Child handles client then calls exit(0).
+   Reap zombies with signal(SIGCHLD, SIG_IGN) or a SIGCHLD handler.
+
+5. PARTIAL LAST CHUNK: chunk_size = (total + 3) / 4. Chunks 1-3 have exactly
+   chunk_size bytes. Chunk 4 has total - 3*chunk_size bytes.
+
+6. RECEIVE LOOP: TCP does not guarantee full reads. Always loop recv() until all
+   expected bytes are received.
+
+7. SEND LOOP: Same for send() -- loop until all bytes sent.
+
+8. LIST DEDUP: Different servers may report the same chunk. Use a bitmask per
+   filename so duplicate reports don't matter.
+
+9. SERVER DIRECTORY: The server stores chunks as "<dir>/<filename>.<chunk_num>".
+   Example: ./dfs1/wine3.jpg.1, ./dfs1/wine3.jpg.2
+
+10. dfc.conf PATH: Always read from "./dfc.conf" (current working directory).
+
+================================================================================
+SECTION 7: TEST PLAN (matches grading script)
+================================================================================
+
+Test 1 (50 pts): All 4 servers up
+    ./dfs ./dfs1 10001 & ./dfs ./dfs2 10002 & ./dfs ./dfs3 10003 & ./dfs ./dfs4 10004 &
+    ./dfc put sample_file/wine3.jpg
+    ./dfc put sample_file/apple_ex.png
+    ./dfc get wine3.jpg  && md5sum wine3.jpg
+    ./dfc get apple_ex.png && md5sum apple_ex.png
+    ./dfc list
+    Verify: each server has exactly 2 chunks per file (8 chunks, 2 files = 16 total)
+
+Test 2 (20 pts): Kill server 4, 3 servers remain
+    kill DFS4
+    ./dfc list        (both files shown, no [incomplete])
+    ./dfc get wine3.jpg && md5sum (matches)
+
+Test 3 (20 pts): Also kill server 2, 2 servers remain (DFS1, DFS3)
+    kill DFS2
+    ./dfc get wine3.jpg && md5sum (still matches)
+
+Test 4 (10 pts): Also kill server 3, only DFS1 remains
+    kill DFS3
+    ./dfc list        (shows "<file> [incomplete]")
+    ./dfc get wine3.jpg  (prints "wine3.jpg is incomplete")
+
+Test 5 (10 pts extra credit): Restart all 4, run 4 concurrent dfc clients
+    4x: ./dfc get wine3.jpg in parallel (different working dirs dfc1-dfc4)
+    All 4 md5sums match original
+
+================================================================================
+END OF OUTLINE
+================================================================================
